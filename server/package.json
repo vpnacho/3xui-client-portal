@@ -1,0 +1,19 @@
+{
+  "name": "3xui-client-portal-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Read-only client subscription portal for the 3x-ui panel",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}

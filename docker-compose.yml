@@ -1,0 +1,25 @@
+services:
+  xui-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: 3xui-client-portal:latest
+    container_name: xui-portal
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Container-internal variables (override anything set in .env for these keys).
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+    # Application settings (PANEL_*, PUBLIC_BASE_URL, VLESS_HOST, ...).
+    env_file:
+      - .env
+    ports:
+      # Host port comes from .env; the container always listens on 3000.
+      - "${PORT:-3000}:3000"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
