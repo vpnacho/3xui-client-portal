@@ -1,5 +1,7 @@
 'use strict';
 
+const https = require('node:https');
+
 /**
  * Minimal, read-only client for the 3x-ui (MHSanaei) panel API.
  *
@@ -21,6 +23,16 @@ const MAX_TOKEN_LENGTH = 128;
 const ONLINE_TTL_MS = 10_000;
 const IP_CACHE_TTL_MS = 30_000;
 const MAX_IP_CACHE_ENTRIES = 500;
+const MAX_SUB_CACHE_ENTRIES = 200;
+/** v2rayNG is what makes 3x-ui answer with the raw subscription body. */
+const SUBSCRIPTION_USER_AGENT = 'v2rayNG/1.8.5';
+/**
+ * Any `scheme://` line is a config line. Matching the shape instead of a fixed
+ * scheme list keeps future panel protocols (tuic, hysteria2, ...) working.
+ */
+const URI_PREFIX = /^[a-z][a-z0-9+.-]*:\/\//i;
+/** `XUI_SUB_URL` may contain `{subId}` / `{token}` instead of a trailing path. */
+const SUBSCRIPTION_PLACEHOLDER = /\{(?:subId|token)\}/i;
 
 class XuiError extends Error {
   constructor(message, { status = 502, code = 'XUI_ERROR', cause } = {}) {
@@ -108,10 +120,10 @@ function normalizeBaseUrl(raw) {
   const value = String(raw || '').trim();
   if (!value) return '';
   const url = new URL(value);
-  url.pathname = url.pathname.replace(/\/+$/, '');
-  url.search = '';
+  // Query strings are kept: some subscription ports need `?format=raw`.
   url.hash = '';
-  return url.toString().replace(/\/$/, '');
+  url.pathname = url.pathname.replace(/\/+$/, '');
+  return url.toString();
 }
 
 /** Extract the anti-CSRF token from the rendered 3x-ui login page. */
@@ -137,10 +149,37 @@ function streamOf(inbound) {
     : parseJsonField(inbound.streamSettings);
 }
 
-function firstExternalProxy(inbound) {
+/**
+ * `streamSettings.externalProxy` arrives either as an array or as a JSON
+ * string; normalize it to a list of usable entries.
+ */
+function externalProxyList(inbound) {
   const stream = streamOf(inbound);
-  const list = Array.isArray(stream.externalProxy) ? stream.externalProxy : [];
-  return list.find((item) => item && (item.dest || item.port)) || null;
+  const parsed = parseJsonField(stream.externalProxy);
+  const list = Array.isArray(parsed) ? parsed : [];
+  return list.filter(
+    (item) =>
+      item &&
+      typeof item === 'object' &&
+      (item.dest || item.port || item.remark || item.forceTls),
+  );
+}
+
+function firstExternalProxy(inbound) {
+  return externalProxyList(inbound)[0] || null;
+}
+
+/** Direct listener host; a wildcard/loopback listener falls back to the panel. */
+function resolveDirectHost(inbound, panelHost) {
+  const listen = String(inbound.listen || '').trim();
+  const wildcard =
+    listen === '' ||
+    listen === '0.0.0.0' ||
+    listen === '::' ||
+    listen === '::0' ||
+    listen === 'localhost' ||
+    listen.startsWith('127.');
+  return wildcard ? panelHost : splitHostPort(listen).host || panelHost;
 }
 
 /**
@@ -156,17 +195,7 @@ function resolveEndpoint(inbound, panelHost) {
   let host = externalAddress.host;
   let port = Number(external?.port) || externalAddress.port || 0;
 
-  if (!host) {
-    const listen = String(inbound.listen || '').trim();
-    const wildcard =
-      listen === '' ||
-      listen === '0.0.0.0' ||
-      listen === '::' ||
-      listen === '::0' ||
-      listen === 'localhost' ||
-      listen.startsWith('127.');
-    host = wildcard ? panelHost : splitHostPort(listen).host || panelHost;
-  }
+  if (!host) host = resolveDirectHost(inbound, panelHost);
   if (!port) port = Number(inbound.port) || 0;
 
   return { host, port, external };
@@ -181,11 +210,15 @@ function externalSni(inbound) {
  * Turn a 3x-ui client + inbound into a vless URI.
  * Supports TCP (+HTTP header), WS, gRPC, HTTPUpgrade and XHTTP transports with
  * none / TLS / Reality security.
+ *
+ * `overrides` mirrors what the panel's own subscription builder does for each
+ * `externalProxy` entry: `security` forces TLS on/off, `sniFallback` fills an
+ * empty TLS server name, `hostFallback` fills an empty transport Host header.
  */
 function buildVlessUri(client, inbound, overrides = {}) {
   const stream = streamOf(inbound);
   const network = String(stream.network || 'tcp').toLowerCase();
-  const security = String(stream.security || 'none').toLowerCase();
+  const security = String(overrides.security || stream.security || 'none').toLowerCase();
   const params = new URLSearchParams();
 
   params.set('type', network);
@@ -212,9 +245,16 @@ function buildVlessUri(client, inbound, overrides = {}) {
     if (spiderX) params.set('spx', spiderX);
   } else if (security === 'tls') {
     const tls = parseJsonField(stream.tlsSettings);
-    const serverName = firstNonEmpty(overrides.sni, tls.serverName, tls.serverNames);
+    // 3x-ui always emits a fingerprint for TLS, defaulting to chrome.
+    params.set('fp', String(firstNonEmpty(tls.fingerprint, 'chrome')));
+    // Panel order: the inbound's serverName wins; an empty one falls back to the
+    // external proxy destination.
+    const serverName = firstNonEmpty(
+      overrides.sni,
+      tls.serverName,
+      overrides.sniFallback,
+    );
     if (serverName) params.set('sni', serverName);
-    if (tls.fingerprint) params.set('fp', String(tls.fingerprint));
     if (Array.isArray(tls.alpn) && tls.alpn.length > 0) {
       params.set('alpn', tls.alpn.join(','));
     }
@@ -226,7 +266,12 @@ function buildVlessUri(client, inbound, overrides = {}) {
   if (network === 'ws') {
     const ws = parseJsonField(stream.wsSettings);
     params.set('path', firstNonEmpty(ws.path, '/'));
-    const wsHost = firstNonEmpty(ws.headers?.Host, ws.headers?.host);
+    const wsHost = firstNonEmpty(
+      ws.headers?.Host,
+      ws.headers?.host,
+      ws.host,
+      overrides.hostFallback,
+    );
     if (wsHost) params.set('host', wsHost);
   } else if (network === 'grpc') {
     const grpc = parseJsonField(stream.grpcSettings);
@@ -240,7 +285,12 @@ function buildVlessUri(client, inbound, overrides = {}) {
       network === 'httpupgrade' ? stream.httpupgradeSettings : stream.xhttpSettings,
     );
     params.set('path', firstNonEmpty(transport.path, '/'));
-    const transportHost = firstNonEmpty(transport.host, transport.headers?.Host);
+    const transportHost = firstNonEmpty(
+      transport.host,
+      transport.headers?.Host,
+      transport.headers?.host,
+      overrides.hostFallback,
+    );
     if (transportHost) params.set('host', transportHost);
   } else if (network === 'tcp') {
     const tcp = parseJsonField(stream.tcpSettings);
@@ -249,7 +299,11 @@ function buildVlessUri(client, inbound, overrides = {}) {
       const request = parseJsonField(header.request);
       params.set('headerType', 'http');
       params.set('path', firstNonEmpty(request.path, '/'));
-      const requestHost = firstNonEmpty(request.headers?.Host, request.headers?.host);
+      const requestHost = firstNonEmpty(
+        request.headers?.Host,
+        request.headers?.host,
+        overrides.hostFallback,
+      );
       if (requestHost) params.set('host', requestHost);
     }
   }
@@ -392,11 +446,223 @@ function buildUriFor(client, inbound, endpoint) {
   return null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Panel subscription (`XUI_SUB_URL`) parsing                                  */
+/* -------------------------------------------------------------------------- */
+
+function uriScheme(line) {
+  const match = String(line || '').trim().match(URI_PREFIX);
+  return match ? match[0].slice(0, -3).toLowerCase() : '';
+}
+
+/** Keep only complete URI lines, preserving their text byte-for-byte. */
+function extractUriLines(text) {
+  return String(text || '')
+    .replace(/^\uFEFF/, '')
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && uriScheme(line) !== '');
+}
+
+/** Tolerate padded, unpadded and URL-safe Base64. */
+function decodeBase64Text(text) {
+  const compact = String(text || '').replace(/\s+/g, '');
+  if (compact === '' || !/^[A-Za-z0-9+/=_-]+$/.test(compact)) return '';
+  const normalized = compact.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  try {
+    const decoded = Buffer.from(padded, 'base64').toString('utf8');
+    // Replacement characters mean the input was not Base64 after all.
+    return decoded.includes('\uFFFD') ? '' : decoded;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * A 3x-ui subscription body is either plain text (one URI per line) or the
+ * Base64 form of that text.
+ */
+function parseSubscriptionBody(body) {
+  const text = String(body || '');
+  const plain = extractUriLines(text);
+  if (plain.length > 0) return plain;
+
+  const decoded = decodeBase64Text(text);
+  return decoded ? extractUriLines(decoded) : [];
+}
+
+function decodeUriComponentSafe(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function lowerOr(value, fallback = '') {
+  const text = String(value || '').trim();
+  return text ? text.toLowerCase() : fallback;
+}
+
+/** `vmess://` carries one Base64-encoded JSON object instead of query params. */
+function describeVmess(uri) {
+  const payload = String(uri).slice('vmess://'.length).split('#')[0];
+  const decoded = decodeBase64Text(payload);
+  if (!decoded) return {};
+  try {
+    const parsed = JSON.parse(decoded);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Display-only metadata for one subscription URI. The URI itself is never
+ * rebuilt or normalized: it is passed through exactly as the panel sent it.
+ */
+function describeUri(uri) {
+  const value = String(uri || '').trim();
+  const protocol = lowerOr(uriScheme(value));
+  if (!protocol) return null;
+
+  const hashIndex = value.indexOf('#');
+  const fragment = hashIndex === -1 ? '' : decodeUriComponentSafe(value.slice(hashIndex + 1));
+  const beforeHash = hashIndex === -1 ? value : value.slice(0, hashIndex);
+  const queryIndex = beforeHash.indexOf('?');
+  const params = new URLSearchParams(queryIndex === -1 ? '' : beforeHash.slice(queryIndex + 1));
+
+  if (protocol === 'vmess') {
+    const payload = describeVmess(value);
+    return {
+      uri: value,
+      remark: firstNonEmpty(fragment, payload.ps),
+      protocol,
+      network: lowerOr(payload.net, 'tcp'),
+      security: lowerOr(payload.tls, 'none'),
+    };
+  }
+
+  const defaultSecurity = protocol === 'trojan' || protocol === 'hysteria2' ? 'tls' : 'none';
+  const defaultNetwork = protocol === 'ss' ? '' : 'tcp';
+  return {
+    uri: value,
+    remark: fragment,
+    protocol,
+    network: lowerOr(params.get('type'), defaultNetwork),
+    security: lowerOr(params.get('security'), defaultSecurity),
+  };
+}
+
+/** Build the display list from a raw subscription body. */
+function parseSubscriptionConfigs(body) {
+  return parseSubscriptionBody(body)
+    .map((uri) => describeUri(uri))
+    .filter(Boolean);
+}
+
+/** A host that is only reachable over the LAN/Docker bridge, never public. */
+function isInternalHost(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === '' || host === 'localhost' || host === 'host.docker.internal') return true;
+  if (host === '::1' || host.startsWith('fe80:') || host.startsWith('fd') || host.startsWith('fc')) {
+    return true;
+  }
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host)) return true;
+  if (/^169\.254\./.test(host)) return true;
+  // CGNAT range, used by some VPS/overlay networks.
+  if (/^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host)) return true;
+  // A single-label name (`xui`, `panel`) only resolves inside a private network.
+  if (!host.includes('.')) return true;
+  const private172 = host.match(/^172\.(\d{1,3})\./);
+  if (private172) {
+    const second = Number(private172[1]);
+    if (second >= 16 && second <= 31) return true;
+  }
+  return false;
+}
+
+/**
+ * Config name used by 3x-ui: `<email>-<externalProxy remark>` when the proxy
+ * entry has one, else `<email>-<inbound remark>`, else the bare email.
+ */
+function configLabel(client, inbound, entry) {
+  const email = String(client.email || '');
+  const destinationRemark = firstNonEmpty(entry?.remark);
+  if (destinationRemark) return `${email}-${destinationRemark}`;
+
+  const inboundRemark = firstNonEmpty(inbound.remark);
+  if (inboundRemark) return `${email}-${inboundRemark}`;
+
+  return email || 'subscription';
+}
+
+/** Map `externalProxy.forceTls` onto the URI security value. */
+function securityForExternalProxy(entry, inboundSecurity) {
+  const forceTls = String(entry?.forceTls || '').toLowerCase();
+  if (forceTls === 'tls') return 'tls';
+  if (forceTls === 'none') return 'none';
+  return inboundSecurity;
+}
+
+/**
+ * Build one vless config per `externalProxy` entry, mirroring the panel's own
+ * subscription generator: each proxy becomes its own address/port/TLS target.
+ * Without `externalProxy`, a single config points at the inbound listener.
+ */
+function buildVlessConfigs(client, inbound, panelHost) {
+  const stream = streamOf(inbound);
+  const network = String(stream.network || 'tcp').toLowerCase();
+  const inboundSecurity = String(stream.security || 'none').toLowerCase();
+  const directHost = resolveDirectHost(inbound, panelHost);
+  const directPort = Number(inbound.port) || 0;
+  const entries = externalProxyList(inbound);
+
+  const targets = entries.length > 0 ? entries : [null];
+  return targets
+    .map((entry) => {
+      // `ep.dest` may carry a port (`host:port`); only the host part is used.
+      const destination = splitHostPort(entry?.dest);
+      const destinationHost = destination.host;
+      const host = destinationHost || directHost;
+      const port = Number(entry?.port) || directPort;
+      const security = securityForExternalProxy(entry, inboundSecurity);
+      const remark = configLabel(client, inbound, entry);
+
+      const uri = buildVlessUri(client, inbound, {
+        host,
+        port,
+        security,
+        // The panel keeps `tlsSettings.serverName` as-is and only falls back to
+        // `ep.dest` when the inbound has no server name; the same destination
+        // fills an empty transport Host header.
+        sniFallback: destinationHost,
+        hostFallback: destinationHost,
+        remark,
+      });
+      if (!uri) return null;
+
+      return {
+        remark,
+        email: String(client.email || ''),
+        protocol: 'vless',
+        network,
+        security,
+        host,
+        port,
+        uri,
+      };
+    })
+    .filter(Boolean);
+}
+
 class XuiService {
   constructor({
     panelUrl = process.env.PANEL_URL,
     username = process.env.PANEL_USERNAME,
     password = process.env.PANEL_PASSWORD,
+    subscriptionUrl = process.env.XUI_SUB_URL,
     cacheTtlSeconds = process.env.CACHE_TTL_SECONDS,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     fetchImpl = globalThis.fetch,
@@ -405,6 +671,13 @@ class XuiService {
     this.username = String(username || '');
     this.password = String(password || '');
     this.panelHost = this.panelUrl ? new URL(this.panelUrl).hostname : '';
+    this.subscriptionUrl = normalizeBaseUrl(subscriptionUrl);
+    // A self-signed certificate on the panel's internal Subscription port is
+    // expected, so HTTPS on an internal host relaxes chain verification. Public
+    // hosts keep full verification.
+    this.subscriptionTlsInsecure =
+      this.subscriptionUrl.startsWith('https://') &&
+      isInternalHost(new URL(this.subscriptionUrl).hostname);
 
     const ttl = Number(cacheTtlSeconds);
     this.cacheTtlMs = Number.isFinite(ttl) && ttl >= 0 ? ttl * 1000 : 15_000;
@@ -419,10 +692,17 @@ class XuiService {
     this.onlineCache = null;
     this.onlinePromise = null;
     this.ipCache = new Map();
+    this.subscriptionCache = new Map();
+    this.subscriptionPromise = null;
+    this.insecureFetchImpl = null;
   }
 
   get isConfigured() {
     return Boolean(this.username && this.password && this.panelUrl);
+  }
+
+  get hasSubscriptionUrl() {
+    return Boolean(this.subscriptionUrl);
   }
 
   /** Fail fast on first use instead of at import time. */
@@ -654,6 +934,175 @@ class XuiService {
     return payload;
   }
 
+  /**
+   * Raw GET against the panel's Subscription service. No cookies are sent: that
+   * endpoint authenticates with the `subId` in the path, not the admin session.
+   */
+  async #requestSubscriptionText(subId) {
+    const target = this.#subscriptionTarget(subId);
+    const headers = {
+      Accept: '*/*',
+      'User-Agent': SUBSCRIPTION_USER_AGENT,
+    };
+
+    // On an internal host the certificate is usually self-signed, and `fetch`
+    // cannot skip verification without a custom dispatcher, so use `node:https`.
+    const response = this.subscriptionTlsInsecure
+      ? await this.#insecureGet(target, headers)
+      : await this.fetchImpl(target, {
+          method: 'GET',
+          headers,
+          redirect: 'follow',
+          signal: AbortSignal.timeout(this.timeoutMs),
+        }).catch((error) => {
+          throw new XuiError('Subscription service is unreachable', {
+            status: 502,
+            code: 'XUI_SUB_UNREACHABLE',
+            cause: error,
+          });
+        });
+
+    const status = Number(response.status || 0);
+    if (status < 200 || status >= 300) {
+      throw new XuiError(`Subscription request failed with HTTP ${status}`, {
+        status: 502,
+        code: 'XUI_SUB_HTTP_ERROR',
+      });
+    }
+    return response.text();
+  }
+
+  /** Substitute `{subId}` when the base URL carries it; otherwise append it. */
+  #subscriptionTarget(subId) {
+    const url = new URL(this.subscriptionUrl);
+    // `new URL()` percent-encodes `{subId}`, so look for both forms. Assigning
+    // the pathname back lets the URL parser encode the token exactly once.
+    const pathname = url.pathname.replace(/%7B(subId|token)%7D/gi, '{$1}');
+    url.pathname = SUBSCRIPTION_PLACEHOLDER.test(pathname)
+      ? pathname.replace(SUBSCRIPTION_PLACEHOLDER, subId)
+      : `${pathname.replace(/\/+$/, '')}/${subId}`;
+    return url.toString();
+  }
+
+  /**
+   * GET over `node:https` without chain verification, used for internal hosts
+   * whose certificate is self-signed. Redirects are followed manually; the
+   * relaxed agent is created once and reused (keep-alive is off because the
+   * subscription port is a different origin from the panel API).
+   */
+  #insecureGet(target, headers, redirectsLeft = 3) {
+    if (!this.insecureFetchImpl) {
+      this.insecureFetchImpl = new https.Agent({ rejectUnauthorized: false, keepAlive: false });
+    }
+
+    return new Promise((resolve, reject) => {
+      const url = new URL(target);
+      const request = https.request(
+        url,
+        {
+          method: 'GET',
+          headers,
+          agent: this.insecureFetchImpl,
+          timeout: this.timeoutMs,
+        },
+        (response) => {
+          const status = Number(response.statusCode) || 0;
+          const location = response.headers.location;
+          if (status >= 300 && status < 400 && location && redirectsLeft > 0) {
+            response.resume();
+            resolve(
+              this.#insecureGet(new URL(location, url).toString(), headers, redirectsLeft - 1),
+            );
+            return;
+          }
+
+          const chunks = [];
+          response.on('data', (chunk) => chunks.push(chunk));
+          response.on('error', (error) =>
+            reject(
+              new XuiError('Subscription service is unreachable', {
+                status: 502,
+                code: 'XUI_SUB_UNREACHABLE',
+                cause: error,
+              }),
+            ),
+          );
+          response.on('end', () => {
+            const body = Buffer.concat(chunks).toString('utf8');
+            if (status < 200 || status >= 300) {
+              reject(
+                new XuiError(`Subscription request failed with HTTP ${status}`, {
+                  status: 502,
+                  code: 'XUI_SUB_HTTP_ERROR',
+                }),
+              );
+              return;
+            }
+            // Minimal `Response`-shaped object so both request paths agree.
+            resolve({ status, text: async () => body });
+          });
+        },
+      );
+
+      request.on('timeout', () => request.destroy(new Error('Subscription request timed out')));
+      request.on('error', (error) =>
+        reject(
+          new XuiError('Subscription service is unreachable', {
+            status: 502,
+            code: 'XUI_SUB_UNREACHABLE',
+            cause: error,
+          }),
+        ),
+      );
+      request.end();
+    });
+  }
+
+  /**
+   * Configs exactly as the panel's Subscription service emits them, cached for
+   * `CACHE_TTL_SECONDS` so a page load does not hammer the sub port.
+   */
+  async getSubscriptionConfigs(subId, { force = false } = {}) {
+    const key = String(subId || '');
+    if (!key || !this.hasSubscriptionUrl) return [];
+
+    const cached = this.subscriptionCache.get(key);
+    if (!force && cached && cached.expiresAt > Date.now()) return cached.configs;
+    // Concurrent page loads for the *same* token share one upstream request.
+    const pending = this.subscriptionPromise;
+    if (!force && pending && pending.key === key) return pending.promise;
+
+    const task = (async () => {
+      const text = await this.#requestSubscriptionText(key);
+      const configs = parseSubscriptionConfigs(text);
+      if (configs.length === 0) {
+        // 3x-ui answers a disabled/expired client with 200 and an empty body;
+        // that is a normal state and yields an empty list. Anything else (HTML
+        // from the panel UI, binary junk) means `XUI_SUB_URL` is misconfigured,
+        // which must surface as an error instead of a silent empty page.
+        if (String(text).trim() === '') return [];
+        throw new XuiError('XUI_SUB_URL did not return a subscription', {
+          status: 502,
+          code: 'XUI_SUB_INVALID_BODY',
+        });
+      }
+
+      if (this.subscriptionCache.size >= MAX_SUB_CACHE_ENTRIES) {
+        const oldest = this.subscriptionCache.keys().next().value;
+        if (oldest !== undefined) this.subscriptionCache.delete(oldest);
+      }
+      this.subscriptionCache.set(key, { configs, expiresAt: Date.now() + this.cacheTtlMs });
+      return configs;
+    })();
+    this.subscriptionPromise = { key, promise: task };
+
+    try {
+      return await task;
+    } finally {
+      if (this.subscriptionPromise?.promise === task) this.subscriptionPromise = null;
+    }
+  }
+
   /** Inbound list, parsed and cached for `CACHE_TTL_SECONDS`. */
   async listInbounds({ force = false } = {}) {
     if (!force && this.inboundsCache && this.inboundsCache.expiresAt > Date.now()) {
@@ -685,7 +1134,14 @@ class XuiService {
   }
 
   /**
-   * Resolve every config matching `subId` across all enabled inbounds.
+   * Resolve one subscription token.
+   *
+   * Usage/expiry/enable still come from `/panel/api/inbounds/list` (the same
+   * data the panel UI shows), but the configs themselves are read from the
+   * panel's own Subscription service when `XUI_SUB_URL` is configured, so the
+   * URIs are byte-identical to what the panel hands to real clients. Without
+   * `XUI_SUB_URL`, the inbound data is used to build the URIs locally.
+   *
    * Returns `null` when the token is unknown.
    */
   async getClientByToken(token) {
@@ -694,7 +1150,9 @@ class XuiService {
     if (!subId || subId.length > MAX_TOKEN_LENGTH) return null;
 
     const inbounds = await this.listInbounds();
-    const configs = [];
+    // Local fallback configs, only used when no subscription URL is configured.
+    const fallbackConfigs = [];
+    let matched = false;
 
     let upload = 0;
     let download = 0;
@@ -714,9 +1172,11 @@ class XuiService {
       );
       if (matching.length === 0) continue;
 
+      matched = true;
       const statsList = Array.isArray(inbound.clientStats) ? inbound.clientStats : [];
       const endpoint = resolveEndpoint(inbound, this.panelHost);
       const stream = streamOf(inbound);
+      const protocol = String(inbound.protocol || '').toLowerCase();
 
       for (const client of matching) {
         const stats = statsList.find(
@@ -739,25 +1199,44 @@ class XuiService {
         enable = enable || configEnable;
         if (!email) email = String(client.email || '');
 
-        configs.push({
-          remark: firstNonEmpty(client.remark, inbound.remark, client.email),
-          email: String(client.email || ''),
-          protocol: String(inbound.protocol || '').toLowerCase(),
-          network: String(stream.network || 'tcp').toLowerCase(),
-          security: String(stream.security || 'none').toLowerCase(),
-          host: endpoint.host,
-          port: endpoint.port,
-          uri: buildUriFor(client, inbound, endpoint),
-        });
+        if (!this.hasSubscriptionUrl) {
+          // VLESS expands one config per `externalProxy` entry, exactly like the
+          // panel's own subscription output.
+          if (protocol === 'vless') {
+            fallbackConfigs.push(...buildVlessConfigs(client, inbound, this.panelHost));
+            continue;
+          }
+
+          fallbackConfigs.push({
+            remark: firstNonEmpty(client.remark, inbound.remark, client.email),
+            email: String(client.email || ''),
+            protocol,
+            network: String(stream.network || 'tcp').toLowerCase(),
+            security: String(stream.security || 'none').toLowerCase(),
+            host: endpoint.host,
+            port: endpoint.port,
+            uri: buildUriFor(client, inbound, endpoint),
+          });
+        }
       }
     }
 
-    if (configs.length === 0) return null;
+    // The subscription service is the source of truth for the config list.
+    const configs = this.hasSubscriptionUrl && matched
+      ? await this.getSubscriptionConfigs(subId)
+      : fallbackConfigs;
+
+    if (!matched) return null;
 
     const usable = configs.filter((config) => typeof config.uri === 'string' && config.uri);
+    // Without a subscription URL an empty list means the inbounds produced no
+    // usable URI, which is a real failure. With one, the panel itself answered
+    // with an empty body: the client exists but is disabled/expired, so keep
+    // the record (the page renders the disabled state, /sub answers 409).
+    if (usable.length === 0 && !this.hasSubscriptionUrl) return null;
 
     return {
-      email: email || configs[0].email,
+      email: email || usable[0]?.email || '',
       enable,
       upload,
       download,
@@ -765,7 +1244,10 @@ class XuiService {
       expiryTime,
       configs: usable,
       // Single-URI field kept for older front-end builds.
-      vlessUri: (usable.find((config) => config.protocol === 'vless') || usable[0])?.uri || null,
+      vlessUri:
+        (
+          usable.find((config) => String(config.protocol).toUpperCase() === 'VLESS') || usable[0]
+        )?.uri || null,
       uris: usable.map((config) => config.uri),
     };
   }
@@ -887,6 +1369,11 @@ module.exports = {
   buildTrojanUri,
   buildShadowsocksUri,
   buildUriFor,
+  buildVlessConfigs,
+  describeUri,
+  parseSubscriptionBody,
+  parseSubscriptionConfigs,
+  isInternalHost,
   extractCsrfToken,
   resolveEndpoint,
   splitHostPort,

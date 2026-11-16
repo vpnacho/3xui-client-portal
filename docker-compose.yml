@@ -6,6 +6,9 @@ services:
     image: 3xui-client-portal:latest
     container_name: xui-portal
     restart: unless-stopped
+    # Lets the container reach the panel's Subscription port on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     security_opt:
       - no-new-privileges:true
     # Container-internal variables (override anything set in .env for these keys).

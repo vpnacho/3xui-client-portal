@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   XuiService,
+  buildVlessConfigs,
   extractCsrfToken,
   resolveEndpoint,
   splitHostPort,
@@ -133,7 +134,7 @@ test('config entries expose remark, protocol, network, security and uri', async 
     'security',
     'uri',
   ]);
-  assert.equal(vless.remark, 'DE-Frankfurt');
+  assert.equal(vless.remark, 'alice@example.com-CDN');
   assert.equal(vless.email, 'alice@example.com');
   assert.equal(vless.network, 'ws');
   assert.equal(vless.security, 'tls');
@@ -141,10 +142,11 @@ test('config entries expose remark, protocol, network, security and uri', async 
   assert.equal(vless.port, 8443);
 
   assert.ok(vless.uri.startsWith('vless://uuid-a@edge.example.com:8443?'), vless.uri);
-  assert.ok(vless.uri.includes('sni=sni.example.com'), 'externalProxy sni is used');
+  assert.ok(vless.uri.includes('sni=de.example.com'), 'tlsSettings.serverName wins over the proxy');
   assert.ok(vless.uri.includes('path=%2Fws'));
   assert.ok(vless.uri.includes('host=de.example.com'));
-  assert.ok(vless.uri.endsWith('#DE-Frankfurt'));
+  assert.ok(vless.uri.includes('fp=chrome'), 'TLS fingerprint defaults to chrome');
+  assert.ok(vless.uri.endsWith('#alice%40example.com-CDN'), vless.uri);
 
   assert.ok(trojan.uri.startsWith('trojan://secret@panel.example.com:2087?'), trojan.uri);
   assert.ok(trojan.uri.includes('serviceName=grpcsvc'));
@@ -162,6 +164,44 @@ test('vmess config is base64 JSON built from the panel listen address', async ()
   assert.equal(payload.port, '2053');
   assert.equal(payload.ps, 'US-NewYork');
   assert.equal(payload.v, '2');
+});
+
+test('WS inbound with externalProxy matches the panel subscription URI exactly', () => {
+  const client = {
+    id: '45faf5f9-7bb5-4b7f-82e8-a7b0321014bb',
+    email: 'h77hew750g',
+  };
+  const inbound = {
+    remark: '',
+    listen: '0.0.0.0',
+    port: 53920,
+    protocol: 'vless',
+    streamSettings: {
+      network: 'ws',
+      security: 'none',
+      wsSettings: { path: '/bxOvaPi', headers: {} },
+      tlsSettings: {},
+      externalProxy: [
+        {
+          dest: 'devops.mydomain.com',
+          port: 443,
+          forceTls: 'tls',
+          remark: 'mDNS',
+        },
+      ],
+    },
+  };
+
+  const configs = buildVlessConfigs(client, inbound, 'panel.example.com');
+  assert.equal(configs.length, 1);
+  assert.equal(
+    configs[0].uri,
+    'vless://45faf5f9-7bb5-4b7f-82e8-a7b0321014bb@devops.mydomain.com:443?type=ws&security=tls&encryption=none&fp=chrome&sni=devops.mydomain.com&path=%2FbxOvaPi&host=devops.mydomain.com#h77hew750g-mDNS',
+  );
+  assert.equal(configs[0].remark, 'h77hew750g-mDNS');
+  assert.equal(configs[0].host, 'devops.mydomain.com');
+  assert.equal(configs[0].port, 443);
+  assert.equal(configs[0].security, 'tls');
 });
 
 test('disabled inbounds and unknown tokens resolve to null', async () => {
