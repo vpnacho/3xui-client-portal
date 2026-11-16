@@ -6,7 +6,7 @@ const fs = require('node:fs');
 /**
  * Environment resolution order:
  *   1. variables already present in process.env (Docker `env_file`, `docker
- *      run -e`, systemd, or the shell) — always win;
+ *      run -e`, systemd, or the shell) - always win;
  *   2. the shared root `.env` file, used for local development and only as a
  *      fallback for keys that are still missing.
  *
@@ -25,9 +25,59 @@ const envFileLoaded = loadEnvFile();
 
 const express = require('express');
 const { XuiService, XuiError } = require('./xuiService');
+const { createLimiter } = require('./rateLimit');
+const { summarizeCountries } = require('./geo');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
+
+/** Minimum token length accepted before the panel is contacted at all. */
+const MIN_TOKEN_LENGTH = 8;
+
+const DEFAULT_ANNOUNCEMENT_TEXT =
+  'این یک متن اطلاعیه تستی است. برای دریافت آخرین وضعیت سرورها و راهنمای اتصال این بخش را بررسی کنید.';
+
+function readString(name, fallback = '') {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  return String(raw).trim();
+}
+
+function readBool(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || String(raw).trim() === '') return fallback;
+  const value = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true;
+  if (['0', 'false', 'no', 'off'].includes(value)) return false;
+  return fallback;
+}
+
+function readPositiveInt(name, fallback, { min = 1, max = 24 * 60 } = {}) {
+  const value = Number(String(process.env[name] ?? '').trim());
+  if (!Number.isFinite(value)) return fallback;
+  const rounded = Math.round(value);
+  if (rounded < min || rounded > max) return fallback;
+  return rounded;
+}
+
+/**
+ * Everything under `publicConfig` is safe to hand to any browser: no panel
+ * origin, credentials, token or client data is included.
+ */
+const publicConfig = {
+  appTitle: readString('APP_TITLE', 'پنل اشتراک'),
+  announcement: {
+    enabled: readBool('ANNOUNCEMENT_ENABLED', true),
+    title: readString('ANNOUNCEMENT_TITLE', 'اطلاعیه مهم'),
+    text: readString('ANNOUNCEMENT_TEXT', DEFAULT_ANNOUNCEMENT_TEXT),
+  },
+  footer: {
+    authorName: readString('FOOTER_AUTHOR_NAME', 'VPNacho'),
+    authorUrl: readString('FOOTER_AUTHOR_URL', 'https://github.com/VPNacho'),
+  },
+  enableHomeLookup: readBool('ENABLE_HOME_LOOKUP', true),
+  profileUpdateInterval: readPositiveInt('PROFILE_UPDATE_INTERVAL', 12, { max: 720 }),
+};
 
 /**
  * The Docker image keeps the repository layout (`/app/server` + `/app/client/dist`)
@@ -40,7 +90,17 @@ const app = express();
 const xui = new XuiService();
 
 app.disable('x-powered-by');
-app.set('trust proxy', true);
+/**
+ * `TRUST_PROXY` controls how `X-Forwarded-For` is trusted. Behind the bundled
+ * reverse proxy one hop is right; the default trusts the immediate proxy only,
+ * so a direct caller cannot spoof the rate-limiter key. Set `TRUST_PROXY=true`
+ * only when the portal itself sits behind a trusted CDN.
+ */
+const trustProxyRaw = String(process.env.TRUST_PROXY ?? '').trim();
+const trustProxy = trustProxyRaw === '' ? 1 : Number.isFinite(Number(trustProxyRaw))
+  ? Number(trustProxyRaw)
+  : trustProxyRaw.toLowerCase() === 'true';
+app.set('trust proxy', trustProxy);
 
 /** Public link for a token, independent of the incoming host header. */
 function subscriptionUrlFor(token) {
@@ -58,7 +118,23 @@ function toPublicClient(client, token) {
     expiryTime: client.expiryTime,
     subscriptionUrl: subscriptionUrlFor(token),
     vlessUri: client.vlessUri,
+    configs: Array.isArray(client.configs)
+      ? client.configs.map(({ remark, protocol, network, security, uri }) => ({
+          remark,
+          protocol,
+          network,
+          security,
+          uri,
+        }))
+      : [],
   };
+}
+
+/** A token shorter than `MIN_TOKEN_LENGTH` can never exist in the panel. */
+function isPlausibleToken(token) {
+  if (typeof token !== 'string') return false;
+  const value = token.trim();
+  return value.length >= MIN_TOKEN_LENGTH && value.length <= 128;
 }
 
 function wantsHtml(req) {
@@ -88,27 +164,75 @@ function handleError(err, req, res, next) {
       error: status >= 500 ? 'Upstream panel is unavailable' : 'Bad request',
     });
   }
-  return res.status(status).type('text/plain').send(status >= 500 ? 'Service unavailable' : 'Not found');
+  return res
+    .status(status)
+    .type('text/plain')
+    .send(status >= 500 ? 'Service unavailable' : 'Not found');
 }
 
-const asyncRoute = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const asyncRoute = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+/**
+ * Strict, IP-based guard for requests that touch the panel (token probes):
+ * 12 requests / minute, and >5 consecutive failures block the IP for 15 min.
+ */
+const publicLimiter = createLimiter({
+  windowMs: 60_000,
+  maxRequests: 12,
+  failureThreshold: 5,
+  blockMs: 15 * 60_000,
+  // A `text/html` request returns the SPA and never reaches the panel, so it
+  // must not burn the 12/min token budget. An active block still applies.
+  skip: (req) => wantsHtml(req),
+});
 
 /* -------------------------------------------------------------------------- */
 /* API                                                                        */
 /* -------------------------------------------------------------------------- */
 
+app.get('/api/public-config', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=60');
+  res.json(publicConfig);
+});
+
 app.get(
   '/api/client/:token',
+  publicLimiter,
   asyncRoute(async (req, res) => {
     const { token } = req.params;
-    const client = await xui.getClientByToken(token);
 
+    if (!isPlausibleToken(token)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const client = await xui.getClientByToken(token);
     if (!client) {
       return res.status(404).json({ error: 'Not found' });
     }
 
+    let online = false;
+    let geo = { connections: 0, countries: [] };
+    try {
+      online = await xui.isClientOnline(client.email);
+    } catch {
+      online = false;
+    }
+    // The IP log is historical, so the country breakdown is still meaningful
+    // while the client is offline. Both calls are cheap and cached.
+    try {
+      geo = summarizeCountries(await xui.getClientIps(client.email));
+    } catch {
+      geo = { connections: 0, countries: [] };
+    }
+
     res.set('Cache-Control', 'no-store');
-    return res.json(toPublicClient(client, token));
+    return res.json({
+      ...toPublicClient(client, token),
+      online,
+      connections: geo.connections,
+      countries: geo.countries,
+    });
   }),
 );
 
@@ -122,29 +246,35 @@ app.get('/api/health', (req, res) => {
 
 app.get(
   '/sub/:token',
+  publicLimiter,
   asyncRoute(async (req, res) => {
     const { token } = req.params;
 
     if (wantsHtml(req)) {
       return sendClientIndex(res);
     }
+    if (!isPlausibleToken(token)) {
+      return res.status(404).type('text/plain').send('Not found');
+    }
 
     const client = await xui.getClientByToken(token);
     if (!client) {
       return res.status(404).type('text/plain').send('Not found');
     }
-    if (!client.vlessUri) {
-      return res.status(409).type('text/plain').send('Subscription has no VLESS config');
+
+    const uris = Array.isArray(client.uris) ? client.uris : [];
+    if (uris.length === 0) {
+      return res.status(409).type('text/plain').send('Subscription has no usable config');
     }
 
     const expire = client.expiryTime > 0 ? Math.floor(client.expiryTime / 1000) : 0;
-    const body = Buffer.from(client.vlessUri, 'utf8').toString('base64');
+    const body = Buffer.from(uris.join('\n'), 'utf8').toString('base64');
 
     res.set({
       'Content-Type': 'text/plain; charset=utf-8',
       'Cache-Control': 'no-store',
       'Subscription-Userinfo': `upload=${client.upload}; download=${client.download}; total=${client.total}; expire=${expire}`,
-      'Profile-Update-Interval': '12',
+      'Profile-Update-Interval': String(publicConfig.profileUpdateInterval),
       'Profile-Title': `base64:${Buffer.from(client.email, 'utf8').toString('base64')}`,
       'Profile-Web-Page-URL': `${subscriptionUrlFor(token)}`,
     });
@@ -183,21 +313,35 @@ app.get('/sub/:token/', (req, res) => {
 app.use(handleError);
 app.use((req, res) => res.status(404).type('text/plain').send('Not found'));
 
-const server = app.listen(PORT, () => {
-  console.log(`[server] listening on http://localhost:${PORT}`);
-  console.log(`[server] config source: ${envFileLoaded ? ENV_FILE : 'process.env only'}`);
-  console.log(`[server] client build: ${fs.existsSync(CLIENT_INDEX) ? CLIENT_DIST : 'MISSING'}`);
-  if (!PUBLIC_BASE_URL) console.warn('[server] PUBLIC_BASE_URL is not set');
-  if (!xui.isConfigured) console.warn('[server] panel credentials are not configured - /api will return 502');
-});
+/**
+ * Bind the port only when this file is the entry point. `node --test` imports
+ * the app to exercise the routes on an ephemeral port instead.
+ */
+function start() {
+  const server = app.listen(PORT, () => {
+    console.log(`[server] listening on http://localhost:${PORT}`);
+    console.log(`[server] config source: ${envFileLoaded ? ENV_FILE : 'process.env only'}`);
+    console.log(`[server] client build: ${fs.existsSync(CLIENT_INDEX) ? CLIENT_DIST : 'MISSING'}`);
+    if (!PUBLIC_BASE_URL) console.warn('[server] PUBLIC_BASE_URL is not set');
+    if (!xui.isConfigured) {
+      console.warn('[server] panel credentials are not configured - /api will return 502');
+    }
+  });
 
-function shutdown(signal) {
-  console.log(`[server] ${signal} received, shutting down`);
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000).unref();
+  function shutdown(signal) {
+    console.log(`[server] ${signal} received, shutting down`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 5000).unref();
+  }
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  return server;
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+if (require.main === module) start();
 
 module.exports = app;
+module.exports.publicConfig = publicConfig;
+module.exports.start = start;

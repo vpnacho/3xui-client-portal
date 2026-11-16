@@ -173,6 +173,14 @@
   }
 }
 
+@supports (scrollbar-width: thin) {
+  /* Slim, on-brand scrollbar for the config list. */
+  .config-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: #2a3247 transparent;
+  }
+}
+
 @layer utilities {
   .no-scrollbar::-webkit-scrollbar {
     display: none;

@@ -46,8 +46,24 @@ export function LoadingState() {
   );
 }
 
+const COPY = {
+  'not-found': {
+    title: 'اشتراکی با این شناسه پیدا نشد',
+    body: 'لینک اشتراک شما ممکن است منقضی شده یا اشتباه کپی شده باشد. لطفاً لینک را دوباره از پشتیبانی دریافت کنید.',
+  },
+  throttled: {
+    title: 'تعداد درخواست‌ها بیش از حد مجاز است',
+    body: 'برای جلوگیری از حدس زدن شناسه‌ها، تعداد درخواست‌های این شبکه موقتاً محدود شده است. چند دقیقه دیگر دوباره تلاش کنید.',
+  },
+  error: {
+    title: 'ارتباط با سرور برقرار نشد',
+    body: 'اطلاعات اشتراک در حال حاضر در دسترس نیست. چند لحظه دیگر دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.',
+  },
+};
+
 export function ErrorState({ kind = 'error', onRetry }) {
   const isNotFound = kind === 'not-found';
+  const copy = COPY[kind] ?? COPY.error;
 
   return (
     <div className="glass hairline-gold relative overflow-hidden rounded-[28px] p-8 text-center">
@@ -63,15 +79,13 @@ export function ErrorState({ kind = 'error', onRetry }) {
       </div>
 
       <h2 className="text-xl font-extrabold text-white">
-        {isNotFound ? 'اشتراکی با این شناسه پیدا نشد' : 'ارتباط با سرور برقرار نشد'}
+        {copy.title}
       </h2>
       <p className="mx-auto mt-2 max-w-sm text-xs leading-6 muted">
-        {isNotFound
-          ? 'لینک اشتراک شما ممکن است منقضی شده یا اشتباه کپی شده باشد. لطفاً لینک را دوباره از پشتیبانی دریافت کنید.'
-          : 'اطلاعات اشتراک در حال حاضر در دسترس نیست. چند لحظه دیگر دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.'}
+        {copy.body}
       </p>
 
-      {!isNotFound && onRetry ? (
+      {kind !== 'not-found' && onRetry ? (
         <button type="button" onClick={onRetry} className="btn btn-gold mx-auto mt-6">
           <RefreshIcon className="h-4 w-4" />
           تلاش مجدد

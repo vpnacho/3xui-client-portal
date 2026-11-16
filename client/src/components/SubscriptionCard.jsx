@@ -1,6 +1,8 @@
-﻿import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { AppLinkButton } from './AppLinkButton';
+import { ConfigList } from './ConfigList';
 import { Countdown } from './Countdown';
+import { LiveStatus } from './LiveStatus';
 import { Modal } from './Modal';
 import { QrCode } from './QrCode';
 import { StatTile } from './StatTile';
@@ -20,6 +22,7 @@ import {
 } from './Icons';
 import { formatBytesShort, formatDate, formatSize, formatSizeText } from '../lib/format';
 import { importApps } from '../lib/links';
+import { copyText } from '../lib/clipboard';
 
 function subscriptionState(client) {
   if (!client.enable) return 'disabled';
@@ -27,7 +30,7 @@ function subscriptionState(client) {
   return 'active';
 }
 
-export function SubscriptionCard({ client }) {
+export function SubscriptionCard({ client, profileUpdateInterval = 12 }) {
   const toast = useToast();
   const [qrOpen, setQrOpen] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -41,23 +44,14 @@ export function SubscriptionCard({ client }) {
   const remainFormatted = formatSize(remaining);
   const totalFormatted = formatSize(total);
 
+  const configs = useMemo(
+    () => (Array.isArray(client.configs) ? client.configs : []),
+    [client.configs],
+  );
+
   const copy = useCallback(async () => {
-    const url = client.subscriptionUrl;
     try {
-      if (navigator.clipboard?.writeText && window.isSecureContext) {
-        await navigator.clipboard.writeText(url);
-      } else {
-        const area = document.createElement('textarea');
-        area.value = url;
-        area.setAttribute('readonly', '');
-        area.style.position = 'fixed';
-        area.style.opacity = '0';
-        document.body.appendChild(area);
-        area.select();
-        const ok = document.execCommand('copy');
-        document.body.removeChild(area);
-        if (!ok) throw new Error('copy failed');
-      }
+      await copyText(client.subscriptionUrl);
       setCopied(true);
       toast.push('لینک اشتراک کپی شد');
       window.setTimeout(() => setCopied(false), 2200);
@@ -119,7 +113,7 @@ export function SubscriptionCard({ client }) {
           className="pointer-events-none absolute -bottom-28 -right-20 h-64 w-64 rounded-full bg-saul-crimson/10 blur-3xl"
         />
 
-        <div className="relative p-6 sm:p-8">
+        <div className="relative space-y-5 p-6 sm:p-8">
           {/* Header ------------------------------------------------------- */}
           <header className="flex flex-wrap items-start justify-between gap-4">
             <div className="min-w-0">
@@ -139,22 +133,28 @@ export function SubscriptionCard({ client }) {
             <StatusBadge state={state} />
           </header>
 
-          <div className="divider my-6" />
+          <LiveStatus
+            online={Boolean(client.online)}
+            connections={client.connections}
+            countries={client.countries}
+          />
+
+          <div className="divider" />
 
           {/* Usage -------------------------------------------------------- */}
           <section className="space-y-4">
             <div className="flex items-end justify-between gap-4">
-              <div>
+              <div className="min-w-0">
                 <p className="eyebrow mb-1">مصرف‌شده</p>
-                <p className="mono text-3xl font-extrabold leading-none text-white">
+                <p dir="ltr" className="mono flex items-baseline gap-1.5 whitespace-nowrap text-3xl font-extrabold leading-none tabular-nums text-white">
                   {usedFormatted.value}
-                  <span className="mr-1.5 text-sm font-bold muted">{usedFormatted.unit}</span>
+                  <span className="text-sm font-bold muted">{usedFormatted.unit}</span>
                 </p>
               </div>
-              <div className="text-left">
+              <div className="shrink-0 text-left">
                 <p className="eyebrow mb-1">از مجموع</p>
-                <p className="mono text-sm font-bold muted">
-                  {total > 0 ? formatSizeText(total) : 'نامحدود'}
+                <p dir="ltr" className="mono whitespace-nowrap text-sm font-bold tabular-nums muted">
+                  {total > 0 ? formatSizeText(total) : '∞'}
                 </p>
               </div>
             </div>
@@ -164,25 +164,31 @@ export function SubscriptionCard({ client }) {
             <div className="grid grid-cols-2 gap-2.5 pt-1">
               <div className="rounded-xl border border-white/[0.07] bg-white/[0.03] px-3.5 py-2.5">
                 <p className="text-[10px] font-semibold muted">باقی‌مانده</p>
-                <p className="mono mt-0.5 text-base font-extrabold text-saul-gold">
+                <p
+                  dir="ltr"
+                  className="mono mt-0.5 truncate whitespace-nowrap text-base font-extrabold tabular-nums text-saul-gold"
+                >
                   {total > 0 ? `${remainFormatted.value} ${remainFormatted.unit}` : '∞'}
                 </p>
               </div>
               <div className="rounded-xl border border-white/[0.07] bg-white/[0.03] px-3.5 py-2.5">
                 <p className="text-[10px] font-semibold muted">مجموع</p>
-                <p className="mono mt-0.5 text-base font-extrabold text-slate-200">
+                <p
+                  dir="ltr"
+                  className="mono mt-0.5 truncate whitespace-nowrap text-base font-extrabold tabular-nums text-slate-200"
+                >
                   {total > 0 ? `${totalFormatted.value} ${totalFormatted.unit}` : '∞'}
                 </p>
               </div>
             </div>
           </section>
 
-          <div className="divider my-6" />
+          <div className="divider" />
 
           {/* Countdown ---------------------------------------------------- */}
           <Countdown expiryTime={client.expiryTime} enable={client.enable} />
 
-          <div className="divider my-6" />
+          <div className="divider" />
 
           {/* Detail tiles -------------------------------------------------- */}
           <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
@@ -199,7 +205,7 @@ export function SubscriptionCard({ client }) {
             ))}
           </div>
 
-          <div className="divider my-6" />
+          <div className="divider" />
 
           {/* Subscription URL --------------------------------------------- */}
           <section className="space-y-3">
@@ -244,7 +250,12 @@ export function SubscriptionCard({ client }) {
             </div>
           </section>
 
-          <div className="divider my-6" />
+          <div className="divider" />
+
+          {/* Configs ------------------------------------------------------ */}
+          <ConfigList configs={configs} subscriptionUrl={client.subscriptionUrl} />
+
+          <div className="divider" />
 
           {/* One-tap imports ---------------------------------------------- */}
           <section className="space-y-3">
@@ -285,7 +296,10 @@ export function SubscriptionCard({ client }) {
       >
         <div className="flex flex-col items-center gap-5">
           <QrCode value={client.subscriptionUrl} />
-          <p className="mono w-full break-all rounded-xl border border-white/10 bg-void-900/60 px-3 py-2 text-center text-[10px] text-slate-400" dir="ltr">
+          <p
+            className="mono w-full break-all rounded-xl border border-white/10 bg-void-900/60 px-3 py-2 text-center text-[10px] text-slate-400"
+            dir="ltr"
+          >
             {client.subscriptionUrl}
           </p>
           <button type="button" onClick={copy} className="btn btn-gold w-full">

@@ -12,7 +12,7 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3000"
-    # Application settings (PANEL_*, PUBLIC_BASE_URL, VLESS_HOST, ...).
+    # Application settings (PANEL_*, PUBLIC_BASE_URL, APP_TITLE, ...).
     env_file:
       - .env
     ports:

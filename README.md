@@ -11,9 +11,26 @@ usage, expiry and VLESS link - no panel credentials, no other users' data.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /sub/:token` | Browser gets the HTML page. Client apps (Happ, Karing, Streisand, v2rayNG, ...) get the base64 subscription with `Subscription-Userinfo` headers. |
-| `GET /api/client/:token` | JSON for the subscription page (`404` when the token is unknown). |
+| `GET /sub/:token` | Browser gets the HTML page. Client apps (Happ, Karing, Streisand, v2rayNG, ...) get **every** config of that `subId`, newline-joined and base64-encoded, with `Subscription-Userinfo` headers. |
+| `GET /api/client/:token` | JSON for the subscription page (`404` when the token is unknown): usage, expiry, every config, live online state and per-country connection counts. |
+| `GET /api/public-config` | Appearance settings only (title, announcement, footer, home lookup, refresh interval). No panel data. |
 | `GET /api/health` | Liveness probe used by `HEALTHCHECK`. |
+
+### Privacy invariants
+
+- Raw client IPs never leave the server. `/api/client/:token` exposes only
+  `{ connections, countries: [{ code, name, count }] }`.
+- The response contains only `email, enable, upload, download, total,
+  expiryTime, subscriptionUrl, vlessUri, configs, online, connections,
+  countries` — never another client, never panel internals.
+- Tokens shorter than 8 characters are rejected before the panel is contacted.
+
+### Abuse protection
+
+`/api/client/:token` and `/sub/:token` share one IP-based limiter:
+12 requests/minute, and more than 5 consecutive failed (4xx/404) requests block
+that IP for 15 minutes. State is in-process, so a single container instance is
+assumed.
 
 ## Configuration
 
@@ -30,15 +47,27 @@ cp .env.example .env
 | `PANEL_URL` | Full panel base URL **including** the secret path, e.g. `https://panel.example.com:2053/secretpath`. |
 | `PANEL_USERNAME`, `PANEL_PASSWORD` | Panel login. |
 | `CACHE_TTL_SECONDS` | In-memory cache for the panel inbound list (`15` is a good default). |
-| `VLESS_HOST` | Host/IP written into `vless://` links. Set it when the panel listen address is `0.0.0.0` or sits behind a proxy/CDN. |
+| `APP_TITLE` | Page title (browser tab and header). |
+| `ANNOUNCEMENT_ENABLED` | Show the announcement card (`true`/`false`). |
+| `ANNOUNCEMENT_TITLE`, `ANNOUNCEMENT_TEXT` | Announcement copy. |
+| `FOOTER_AUTHOR_NAME`, `FOOTER_AUTHOR_URL` | Footer credit and its link. |
+| `ENABLE_HOME_LOOKUP` | Show the subscription lookup form on `/`. |
+| `PROFILE_UPDATE_INTERVAL` | `Profile-Update-Interval` header in hours (`1`-`720`). |
 
 Variables injected by Docker (`env_file`, `-e`, `environment`) take precedence;
 `server/index.js` falls back to a local `.env` file only for keys that are
 still missing.
 
-`VLESS_HOST` has no safe default. If you leave it empty and the inbound listens
-on `0.0.0.0`, links use the panel hostname — which is usually correct only when
-the panel and the proxy share a public address. Set it explicitly in production.
+### Connection details come from the panel
+
+Links are built straight from the panel: `externalProxy` (address, port, SNI)
+when the inbound defines one, otherwise the inbound `listen`/`port`. There is no
+host override any more, so the address shown in the panel is the address clients
+receive. If the panel listens on `0.0.0.0`/`127.0.0.1`, set a public
+`externalProxy` (or the `listen` address) in the panel itself.
+
+Sizes are taken as the panel reports them: `stats.total` is already **bytes**,
+so a 5 GB plan renders as `5 GB`.
 
 ## Run with Docker Compose
 
