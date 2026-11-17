@@ -5,3 +5,5 @@ server/.npm-cache/
 .env
 .tmp-*
 *.log
+*.tar.gz
+.DS_Store
