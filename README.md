@@ -1,5 +1,7 @@
 # 3x-ui Client Portal
 
+[![CI / Build & Test](https://github.com/vpnacho/3xui-client-portal/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/vpnacho/3xui-client-portal/actions/workflows/ci.yml)
+
 Read-only subscription portal for a [3x-ui (MHSanaei)](https://github.com/MHSanaei/3x-ui) panel.
 Each client gets a personal page at `/sub/:token` that exposes **only their own**
 usage, expiry and VLESS link - no panel credentials, no other users' data.
