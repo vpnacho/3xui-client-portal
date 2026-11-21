@@ -17,6 +17,7 @@ export const DEFAULT_PUBLIC_CONFIG = {
   },
   enableHomeLookup: true,
   profileUpdateInterval: 12,
+  subPath: 'sub',
 };
 
 function mergeConfig(payload) {

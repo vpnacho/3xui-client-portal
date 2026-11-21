@@ -706,6 +706,10 @@ class XuiService {
     this.subscriptionCache = new Map();
     this.subscriptionPromise = null;
     this.insecureFetchImpl = null;
+    // Instance-level endpoint cache: set after the first successful probe so
+    // panels that only expose the clients/* routes never hit the inbounds/* 404.
+    this._onlineApiPath = null;   // null = not yet probed
+    this._ipsApiPrefix = null;    // null = not yet probed
   }
 
   get isConfigured() {
@@ -946,6 +950,25 @@ class XuiService {
   }
 
   /**
+   * Helper for fallback routes: tries the primary path with POST, and if it
+   * returns HTTP 404, returns `null` instead of throwing. All other errors
+   * (401, 403, 500...) propagate normally. Used for endpoint discovery: if the
+   * standard route doesn't exist, the caller knows to try the alternate route.
+   */
+  async #requestPost404Null(path, options) {
+    try {
+      return await this.#request(path, { ...options, method: 'POST' });
+    } catch (error) {
+      if (error instanceof XuiError && error.status === 502) {
+        // Extract the HTTP status from the message: "Panel request failed with HTTP 404"
+        const match = String(error.message || '').match(/HTTP (\d{3})/);
+        if (match && Number(match[1]) === 404) return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Raw GET against the panel's Subscription service. No cookies are sent: that
    * endpoint authenticates with the `subId` in the path, not the admin session.
    */
@@ -1176,6 +1199,17 @@ class XuiService {
     let enable = false;
     let email = '';
 
+    // Deduplicate traffic stats: when the same client is attached to multiple
+    // inbounds under the same subId, 3x-ui shares one global counter — every
+    // inbound's clientStats entry carries IDENTICAL values (up/down/total).
+    // We key on (normalizedEmail + up + down + total) so the same shared counter
+    // is counted only once, while genuinely different per-inbound stats for the
+    // same email (different values) are still summed.
+    const seenStats = new Set();
+    // Collect every distinct email attached to this subId across all inbounds.
+    // The HTTP layer uses these to aggregate online state and IPs.
+    const allEmailsForSub = new Set();
+
     for (const inbound of inbounds) {
       if (inbound.enable === false) continue;
       const clients = inbound.settings?.clients;
@@ -1193,25 +1227,49 @@ class XuiService {
       const protocol = String(inbound.protocol || '').toLowerCase();
 
       for (const client of matching) {
+        // Track every distinct email across all matched inbounds for this subId.
+        const clientEmail = String(client.email || '').trim();
+        if (clientEmail) allEmailsForSub.add(clientEmail);
+
         const stats = statsList.find(
           (item) => item && (item.email === client.email || item.id === client.id),
         );
 
-        const up = Math.max(0, Number(stats?.up) || 0);
-        const down = Math.max(0, Number(stats?.down) || 0);
-        // `stats.total` is already bytes in 3x-ui. Multiplying `client.totalGB`
-        // by 1024^3 turned 5 GB into ~5 EB, so nothing is scaled here.
-        const configTotal = Math.max(0, Number(stats?.total) || 0);
-        const configExpiry = normalizeEpochMs(stats?.expiryTime || client.expiryTime);
-        const configEnable = stats ? Boolean(stats.enable) : Boolean(client.enable);
+        if (stats) {
+          const up = Math.max(0, Number(stats.up) || 0);
+          const down = Math.max(0, Number(stats.down) || 0);
+          // `stats.total` is already bytes in 3x-ui. Multiplying `client.totalGB`
+          // by 1024^3 turned 5 GB into ~5 EB, so nothing is scaled here.
+          const configTotal = Math.max(0, Number(stats.total) || 0);
 
-        upload += up;
-        download += down;
-        if (configTotal === 0) unlimited = true;
-        else totalSum += configTotal;
-        expiryTime = Math.max(expiryTime, configExpiry);
-        enable = enable || configEnable;
-        if (!email) email = String(client.email || '');
+          // Dedup key: identical (email, up, down, total) means the same shared
+          // counter appearing in every inbound — count it only once. Different
+          // values for the same email mean genuine per-inbound stats — sum them.
+          const normalizedEmail = String(stats.email || client.email || '').toLowerCase().trim();
+          const statsKey = `${normalizedEmail}:${up}:${down}:${configTotal}`;
+
+          if (!seenStats.has(statsKey)) {
+            const configExpiry = normalizeEpochMs(stats.expiryTime || client.expiryTime);
+            const configEnable = Boolean(stats.enable);
+
+            upload += up;
+            download += down;
+            if (configTotal === 0) unlimited = true;
+            else totalSum += configTotal;
+            expiryTime = Math.max(expiryTime, configExpiry);
+            enable = enable || configEnable;
+            if (!email) email = String(client.email || '');
+
+            seenStats.add(statsKey);
+          }
+        } else {
+          // No stats entry: honor the client record for enable/expiry only.
+          const configExpiry = normalizeEpochMs(client.expiryTime);
+          const configEnable = Boolean(client.enable);
+          expiryTime = Math.max(expiryTime, configExpiry);
+          enable = enable || configEnable;
+          if (!email) email = String(client.email || '');
+        }
 
         if (!this.hasSubscriptionUrl) {
           // VLESS expands one config per `externalProxy` entry, exactly like the
@@ -1257,6 +1315,9 @@ class XuiService {
       total: unlimited ? 0 : totalSum,
       expiryTime,
       configs: usable,
+      // All distinct emails attached to this subId (for multi-inbound aggregation
+      // of online state and IPs by the HTTP layer).
+      allEmails: [...allEmailsForSub],
       // Single-URI field kept for older front-end builds.
       vlessUri:
         (
@@ -1274,9 +1335,21 @@ class XuiService {
     if (this.onlinePromise) return this.onlinePromise;
 
     this.onlinePromise = (async () => {
-      const payload = await this.#request('/panel/api/inbounds/onlines', {
-        method: 'POST',
-      });
+      let payload;
+      // Try the standard inbounds route first; on 404, fallback to clients route.
+      if (this._onlineApiPath === null) {
+        // Not yet cached: probe both routes and remember which one works.
+        payload = await this.#requestPost404Null('/panel/api/inbounds/onlines');
+        if (payload === null) {
+          payload = await this.#request('/panel/api/clients/onlines', { method: 'POST' });
+          this._onlineApiPath = '/panel/api/clients/onlines';
+        } else {
+          this._onlineApiPath = '/panel/api/inbounds/onlines';
+        }
+      } else {
+        // Use the cached working path directly.
+        payload = await this.#request(this._onlineApiPath, { method: 'POST' });
+      }
 
       let list = [];
       const obj = payload.obj;
@@ -1312,7 +1385,13 @@ class XuiService {
     const value = String(email || '').trim();
     if (!value) return false;
     const emails = await this.getOnlineEmails();
-    return emails.has(value);
+    // Case-insensitive match: the panel stores emails exactly as configured, but
+    // the client records and the onlines list may differ in case.
+    const lower = value.toLowerCase();
+    for (const e of emails) {
+      if (typeof e === 'string' && e.toLowerCase() === lower) return true;
+    }
+    return false;
   }
 
   /**
@@ -1330,17 +1409,56 @@ class XuiService {
     const promise = (async () => {
       let ips = [];
       try {
-        const payload = await this.#request(
-          `/panel/api/inbounds/clientIps/${encodeURIComponent(value)}`,
-          { method: 'POST' },
-        );
+        const encoded = encodeURIComponent(value);
+
+        let payload;
+        if (this._ipsApiPrefix === null) {
+          // Not yet cached: probe the inbounds route first.
+          payload = await this.#requestPost404Null(
+            `/panel/api/inbounds/clientIps/${encoded}`,
+          );
+          if (payload === null) {
+            payload = await this.#request(
+              `/panel/api/clients/ips/${encoded}`,
+              { method: 'POST' },
+            );
+            this._ipsApiPrefix = '/panel/api/clients/ips';
+          } else {
+            this._ipsApiPrefix = '/panel/api/inbounds/clientIps';
+          }
+        } else {
+          payload = await this.#request(
+            `${this._ipsApiPrefix}/${encoded}`,
+            { method: 'POST' },
+          );
+        }
+
         const obj = payload.obj ?? payload;
-        if (Array.isArray(obj)) ips = obj;
-        else if (obj && typeof obj === 'object') ips = Object.keys(obj);
-        else if (typeof obj === 'string' && obj.trim() !== '') {
+        if (Array.isArray(obj)) {
+          // Object-array format: [{ ip, time, node }] or plain string array.
+          ips = obj.map((entry) => {
+            if (typeof entry === 'string') return entry;
+            if (entry && typeof entry === 'object') {
+              return entry.ip ?? entry.IP ?? entry.addr ?? entry.address ?? '';
+            }
+            return '';
+          }).filter(Boolean);
+        } else if (obj && typeof obj === 'object') {
+          ips = Object.keys(obj);
+        } else if (typeof obj === 'string' && obj.trim() !== '') {
           try {
             const parsed = JSON.parse(obj);
-            ips = Array.isArray(parsed) ? parsed : Object.keys(parsed || {});
+            if (Array.isArray(parsed)) {
+              ips = parsed.map((entry) => {
+                if (typeof entry === 'string') return entry;
+                if (entry && typeof entry === 'object') {
+                  return entry.ip ?? entry.IP ?? entry.addr ?? entry.address ?? '';
+                }
+                return '';
+              }).filter(Boolean);
+            } else {
+              ips = Object.keys(parsed || {});
+            }
           } catch {
             ips = [];
           }

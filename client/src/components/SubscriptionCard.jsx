@@ -72,13 +72,15 @@ export function SubscriptionCard({ client, profileUpdateInterval = 12 }) {
     () => [
       {
         label: 'آپلود',
-        value: formatBytesShort(client.upload),
+        value: formatBytesShort(client.upload).value,
+        unit: formatBytesShort(client.upload).unit,
         icon: <ArrowUpIcon className="h-3.5 w-3.5" />,
         accent: 'default',
       },
       {
         label: 'دانلود',
-        value: formatBytesShort(client.download),
+        value: formatBytesShort(client.download).value,
+        unit: formatBytesShort(client.download).unit,
         icon: <ArrowDownIcon className="h-3.5 w-3.5" />,
         accent: 'default',
       },
@@ -123,7 +125,11 @@ export function SubscriptionCard({ client, profileUpdateInterval = 12 }) {
                 </span>
                 <p className="eyebrow text-saul-gold/80">3X-UI · ACCESS KEY</p>
               </div>
-              <h1 className="truncate text-2xl font-extrabold leading-tight text-white text-glow-gold sm:text-[28px]">
+              <h1
+                dir="ltr"
+                className="truncate text-2xl font-extrabold leading-tight text-white text-glow-gold sm:text-[28px]"
+                style={{ unicodeBidi: 'plaintext' }}
+              >
                 {client.email || 'اشتراک من'}
               </h1>
               <p className="mt-1.5 text-xs muted">

@@ -28,8 +28,10 @@ export const importApps = [
   },
 ];
 
-export function parseToken(pathname = window.location.pathname) {
-  const match = pathname.match(/^\/sub\/([^/]+)\/?$/);
+export function parseToken(pathname = window.location.pathname, subPath = 'sub') {
+  const segment = String(subPath || 'sub').replace(/^\/+|\/+$/g, '');
+  const pattern = new RegExp(`^\\/${segment}\\/([^/]+)\\/?$`);
+  const match = pathname.match(pattern);
   if (!match) return '';
   try {
     return decodeURIComponent(match[1]);

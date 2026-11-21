@@ -10,7 +10,7 @@ const TOKEN_PATTERN = /^[A-Za-z0-9_-]{6,64}$/;
  * Root-page subscription lookup. The token is validated locally, then
  * pre-checked against the API before navigation — nothing is stored or logged.
  */
-export function HomeLookup() {
+export function HomeLookup({ subPath = 'sub' }) {
   const [value, setValue] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -88,7 +88,7 @@ export function HomeLookup() {
           return;
         }
 
-        window.location.assign(`/sub/${encodeURIComponent(token)}`);
+        window.location.assign(`/${encodeURIComponent(subPath || 'sub')}/${encodeURIComponent(token)}`);
       } catch {
         setError('خطا در ارتباط با سرور. لطفاً دوباره تلاش کنید.');
         setLoading(false);

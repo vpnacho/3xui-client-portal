@@ -57,6 +57,36 @@ function readPositiveInt(name, fallback, { min = 1, max = 24 * 60 } = {}) {
   return rounded;
 }
 
+const SUB_PATH_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
+/**
+ * Paths that already belong to the app or to the static bundle. Express routes
+ * are case-insensitive by default, so the comparison is case-insensitive too.
+ */
+const RESERVED_SUB_PATHS = new Set(['api', 'assets', 'health']);
+
+/**
+ * Turns `SUB_PATH` into a single, safe URL segment. Empty means "use the
+ * default"; an invalid value falls back to `sub` so a typo cannot take the
+ * subscription routes down, and `onInvalid` lets the caller report it.
+ */
+function resolveSubPath(raw = '', { onInvalid } = {}) {
+  const value = String(raw ?? '').trim().replace(/^\/+|\/+$/g, '');
+  if (value === '') return 'sub';
+  if (!SUB_PATH_PATTERN.test(value) || RESERVED_SUB_PATHS.has(value.toLowerCase())) {
+    if (typeof onInvalid === 'function') onInvalid(value);
+    return 'sub';
+  }
+  return value;
+}
+
+const SUB_PATH = resolveSubPath(process.env.SUB_PATH, {
+  onInvalid: (value) =>
+    console.error(
+      `[server] SUB_PATH="${value}" is invalid; expected ^[A-Za-z0-9_-]{1,32}$ ` +
+        'and no reserved prefix (api, assets, health). Falling back to "sub".',
+    ),
+});
+
 /**
  * Everything under `publicConfig` is safe to hand to any browser: no panel
  * origin, credentials, token or client data is included.
@@ -74,6 +104,7 @@ const publicConfig = {
   },
   enableHomeLookup: readBool('ENABLE_HOME_LOOKUP', true),
   profileUpdateInterval: readPositiveInt('PROFILE_UPDATE_INTERVAL', 12, { max: 720 }),
+  subPath: SUB_PATH,
 };
 
 /**
@@ -102,7 +133,7 @@ app.set('trust proxy', trustProxy);
 /** Public link for a token, independent of the incoming host header. */
 function subscriptionUrlFor(token) {
   const base = PUBLIC_BASE_URL || `http://localhost:${PORT}`;
-  return `${base}/sub/${encodeURIComponent(token)}`;
+  return `${base}/${SUB_PATH}/${encodeURIComponent(token)}`;
 }
 
 function toPublicClient(client, token) {
@@ -222,15 +253,27 @@ app.get(
 
     let online = false;
     let geo = { connections: 0, countries: [] };
+    // Collect every distinct email attached to this subscription across all
+    // inbounds, so a multi-inbound setup reports the correct online state and
+    // aggregated IPs rather than only looking at the first email found.
+    const emailsToCheck = Array.isArray(client.allEmails) && client.allEmails.length > 0
+      ? client.allEmails
+      : [client.email].filter(Boolean);
+
     try {
-      online = await xui.isClientOnline(client.email);
+      // Online if ANY of the client's emails is in the onlines list.
+      const onlineResults = await Promise.all(emailsToCheck.map((e) => xui.isClientOnline(e)));
+      online = onlineResults.some(Boolean);
     } catch {
       online = false;
     }
     // The IP log is historical, so the country breakdown is still meaningful
     // while the client is offline. Both calls are cheap and cached.
     try {
-      geo = summarizeCountries(await xui.getClientIps(client.email));
+      const ipLists = await Promise.all(emailsToCheck.map((e) => xui.getClientIps(e)));
+      // Flatten and deduplicate all IPs before passing to summarizeCountries.
+      const allIps = [...new Set(ipLists.flat())];
+      geo = summarizeCountries(allIps);
     } catch {
       geo = { connections: 0, countries: [] };
     }
@@ -254,7 +297,7 @@ app.get('/api/health', (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 app.get(
-  '/sub/:token',
+  `/${SUB_PATH}/:token`,
   publicLimiter,
   asyncRoute(async (req, res) => {
     const { token } = req.params;
@@ -314,9 +357,9 @@ app.get('/', (req, res) => {
 });
 
 // SPA fallback for the browser-facing subscription page.
-app.get('/sub/:token/', (req, res) => {
+app.get(`/${SUB_PATH}/:token/`, (req, res) => {
   if (wantsHtml(req)) return sendClientIndex(res);
-  return res.redirect(307, `/sub/${encodeURIComponent(req.params.token)}`);
+  return res.redirect(307, `/${SUB_PATH}/${encodeURIComponent(req.params.token)}`);
 });
 
 app.use(handleError);
@@ -354,4 +397,5 @@ if (require.main === module) start();
 module.exports = app;
 module.exports.publicConfig = publicConfig;
 module.exports.publicLimiter = publicLimiter;
+module.exports.resolveSubPath = resolveSubPath;
 module.exports.start = start;

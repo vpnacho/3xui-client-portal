@@ -22,6 +22,8 @@ process.env.ANNOUNCEMENT_TITLE = 'عنوان تستی';
 process.env.FOOTER_AUTHOR_NAME = 'Tester';
 process.env.ENABLE_HOME_LOOKUP = 'false';
 process.env.PROFILE_UPDATE_INTERVAL = '6';
+// Explicit unset so the default 'sub' resolveSubPath path is taken.
+delete process.env.SUB_PATH;
 
 const app = require('../index');
 const { publicLimiter } = require('../index');
@@ -75,7 +77,7 @@ test('GET /api/public-config exposes appearance settings only', async () => {
   const body = JSON.parse(res.body);
   assert.deepEqual(
     Object.keys(body).sort(),
-    ['announcement', 'appTitle', 'enableHomeLookup', 'footer', 'profileUpdateInterval'].sort(),
+    ['announcement', 'appTitle', 'enableHomeLookup', 'footer', 'profileUpdateInterval', 'subPath'].sort(),
   );
   assert.equal(body.footer.authorName, 'Tester');
   assert.equal(body.announcement.title, 'عنوان تستی');
