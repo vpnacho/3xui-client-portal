@@ -215,6 +215,40 @@ test('disabled inbounds and unknown tokens resolve to null', async () => {
   assert.equal(await xui.getClientByToken(null), null);
 });
 
+test('malformed tokens are rejected before the panel is contacted', async () => {
+  const { xui, stub } = service();
+  const bad = [
+    ' tokenalice01',
+    'tokenalice01 ',
+    'token alice01',
+    'token\talice01',
+    'token\nalice01',
+    'alice@example.com',
+    'tokenalice01!',
+    'token+plus01',
+    'ok123',
+    'x'.repeat(65),
+    '',
+    null,
+    42,
+  ];
+  for (const token of bad) {
+    assert.equal(await xui.getClientByToken(token), null, `rejected: ${JSON.stringify(token)}`);
+  }
+  assert.equal(stub.state.calls.length, 0, 'invalid tokens never reach the panel');
+
+  // A valid token in the exact same shape as above still resolves.
+  assert.ok(await xui.getClientByToken('tokenalice01'));
+});
+
+test('exact subId matches; emails and UUIDs are never lookup keys', async () => {
+  const { xui } = service();
+  assert.ok(await xui.getClientByToken('tokenalice01'), 'valid subId succeeds');
+  assert.equal(await xui.getClientByToken('alice@example.com'), null, 'email rejected');
+  assert.equal(await xui.getClientByToken('bob@example.com'), null, 'other email rejected');
+  assert.equal(await xui.getClientByToken('uuid-a'), null, 'UUID not a lookup key');
+});
+
 test('online state is read from the onlines endpoint', async () => {
   const { xui } = service();
   assert.equal(await xui.isClientOnline('alice@example.com'), true);

@@ -1,4 +1,5 @@
 ﻿import { AlertIcon, BoltIcon, RefreshIcon, SpinnerIcon } from './Icons';
+import { useNow } from '../hooks/useNow';
 
 export function LoadingState() {
   return (
@@ -53,7 +54,7 @@ const COPY = {
   },
   throttled: {
     title: 'تعداد درخواست‌ها بیش از حد مجاز است',
-    body: 'برای جلوگیری از حدس زدن شناسه‌ها، تعداد درخواست‌های این شبکه موقتاً محدود شده است. چند دقیقه دیگر دوباره تلاش کنید.',
+    body: 'برای جلوگیری از حدس زدن شناسه‌ها، تعداد درخواست‌های این شبکه موقتاً محدود شده است.',
   },
   error: {
     title: 'ارتباط با سرور برقرار نشد',
@@ -61,7 +62,35 @@ const COPY = {
   },
 };
 
-export function ErrorState({ kind = 'error', onRetry }) {
+/** Inner component so useNow only ticks when actually throttled. */
+function ThrottledCountdown({ retryUntil, onRetry }) {
+  const now = useNow(retryUntil > 0);
+  const secsLeft = retryUntil > 0 ? Math.max(0, Math.ceil((retryUntil - now) / 1000)) : 0;
+  const blocked = secsLeft > 0;
+
+  return (
+    <>
+      <p className="mx-auto mt-2 max-w-sm text-xs leading-6 muted">
+        {blocked
+          ? `${secsLeft} ثانیه دیگر دوباره تلاش کنید.`
+          : 'چند دقیقه دیگر دوباره تلاش کنید.'}
+      </p>
+      {onRetry ? (
+        <button
+          type="button"
+          onClick={onRetry}
+          disabled={blocked}
+          className="btn btn-gold mx-auto mt-6 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <RefreshIcon className="h-4 w-4" />
+          {blocked ? `${secsLeft} ثانیه` : 'تلاش مجدد'}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+export function ErrorState({ kind = 'error', retryUntil = 0, onRetry }) {
   const isNotFound = kind === 'not-found';
   const copy = COPY[kind] ?? COPY.error;
 
@@ -81,16 +110,22 @@ export function ErrorState({ kind = 'error', onRetry }) {
       <h2 className="text-xl font-extrabold text-white">
         {copy.title}
       </h2>
-      <p className="mx-auto mt-2 max-w-sm text-xs leading-6 muted">
-        {copy.body}
-      </p>
 
-      {kind !== 'not-found' && onRetry ? (
-        <button type="button" onClick={onRetry} className="btn btn-gold mx-auto mt-6">
-          <RefreshIcon className="h-4 w-4" />
-          تلاش مجدد
-        </button>
-      ) : null}
+      {kind === 'throttled' ? (
+        <ThrottledCountdown retryUntil={retryUntil} onRetry={onRetry} />
+      ) : (
+        <>
+          <p className="mx-auto mt-2 max-w-sm text-xs leading-6 muted">
+            {copy.body}
+          </p>
+          {kind !== 'not-found' && onRetry ? (
+            <button type="button" onClick={onRetry} className="btn btn-gold mx-auto mt-6">
+              <RefreshIcon className="h-4 w-4" />
+              تلاش مجدد
+            </button>
+          ) : null}
+        </>
+      )}
     </div>
   );
 }

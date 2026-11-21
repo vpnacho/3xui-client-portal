@@ -24,15 +24,12 @@ function loadEnvFile() {
 const envFileLoaded = loadEnvFile();
 
 const express = require('express');
-const { XuiService, XuiError } = require('./xuiService');
+const { XuiService, XuiError, isValidSubscriptionToken } = require('./xuiService');
 const { createLimiter } = require('./rateLimit');
 const { summarizeCountries } = require('./geo');
 
 const PORT = Number(process.env.PORT) || 3000;
 const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
-
-/** Minimum token length accepted before the panel is contacted at all. */
-const MIN_TOKEN_LENGTH = 8;
 
 const DEFAULT_ANNOUNCEMENT_TEXT =
   'این یک متن اطلاعیه تستی است. برای دریافت آخرین وضعیت سرورها و راهنمای اتصال این بخش را بررسی کنید.';
@@ -130,11 +127,14 @@ function toPublicClient(client, token) {
   };
 }
 
-/** A token shorter than `MIN_TOKEN_LENGTH` can never exist in the panel. */
+/**
+ * A token must be an exact panel `subId` (`^[A-Za-z0-9_-]{6,64}$`). Emails,
+ * UUIDs, whitespace and any other shape are rejected before the panel is
+ * contacted and answered with the same generic 404 as an unknown token, so
+ * token existence is never leaked.
+ */
 function isPlausibleToken(token) {
-  if (typeof token !== 'string') return false;
-  const value = token.trim();
-  return value.length >= MIN_TOKEN_LENGTH && value.length <= 128;
+  return isValidSubscriptionToken(token);
 }
 
 function wantsHtml(req) {
@@ -174,14 +174,23 @@ const asyncRoute = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
 /**
+ * Rate-limit thresholds are configurable via env vars so operators can tune
+ * them without rebuilding; the defaults stay at the safe production values.
+ */
+function readPositiveIntUnbounded(name, fallback) {
+  const v = Number(String(process.env[name] ?? '').trim());
+  return Number.isFinite(v) && v > 0 ? Math.round(v) : fallback;
+}
+
+/**
  * Strict, IP-based guard for requests that touch the panel (token probes):
  * 12 requests / minute, and >5 consecutive failures block the IP for 15 min.
  */
 const publicLimiter = createLimiter({
-  windowMs: 60_000,
-  maxRequests: 12,
-  failureThreshold: 5,
-  blockMs: 15 * 60_000,
+  windowMs: readPositiveIntUnbounded('RATE_LIMIT_WINDOW_MS', 60_000),
+  maxRequests: readPositiveIntUnbounded('RATE_LIMIT_MAX_REQUESTS', 12),
+  failureThreshold: readPositiveIntUnbounded('RATE_LIMIT_FAILURE_THRESHOLD', 5),
+  blockMs: readPositiveIntUnbounded('RATE_LIMIT_BLOCK_MS', 15 * 60_000),
   // A `text/html` request returns the SPA and never reaches the panel, so it
   // must not burn the 12/min token budget. An active block still applies.
   skip: (req) => wantsHtml(req),
@@ -344,4 +353,5 @@ if (require.main === module) start();
 
 module.exports = app;
 module.exports.publicConfig = publicConfig;
+module.exports.publicLimiter = publicLimiter;
 module.exports.start = start;

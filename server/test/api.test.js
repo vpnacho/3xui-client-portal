@@ -24,6 +24,7 @@ process.env.ENABLE_HOME_LOOKUP = 'false';
 process.env.PROFILE_UPDATE_INTERVAL = '6';
 
 const app = require('../index');
+const { publicLimiter } = require('../index');
 
 let server;
 let port;
@@ -150,6 +151,33 @@ test('unknown tokens return 404 for both JSON and subscription routes', async ()
 
   const sub = await get('/sub/unknown9999', { Accept: '*/*' });
   assert.equal(sub.status, 404);
+});
+
+test('a valid email is rejected with the same generic 404, panel untouched', async () => {
+  stub.state.calls.length = 0;
+  const api = await get('/api/client/alice%40example.com', { Accept: 'application/json' });
+  assert.equal(api.status, 404);
+  assert.deepEqual(JSON.parse(api.body), { error: 'Not found' });
+
+  const sub = await get('/sub/alice%40example.com', { Accept: '*/*' });
+  assert.equal(sub.status, 404);
+  assert.equal(stub.state.calls.length, 0, 'panel must not be queried for an email');
+});
+
+test('tokens with whitespace or invalid characters are rejected before the panel', async () => {
+  // Reset any failure-block state accumulated by prior 404 tests from 127.0.0.1.
+  publicLimiter.limiter.reset();
+  stub.state.calls.length = 0;
+  const space = await get('/api/client/token%20alice01', { Accept: 'application/json' });
+  assert.equal(space.status, 404);
+  assert.deepEqual(JSON.parse(space.body), { error: 'Not found' });
+
+  const plus = await get('/sub/token%2Bplus01', { Accept: '*/*' });
+  assert.equal(plus.status, 404);
+
+  const bang = await get('/sub/tokenalice01!', { Accept: '*/*' });
+  assert.equal(bang.status, 404);
+  assert.equal(stub.state.calls.length, 0, 'panel must not be queried');
 });
 
 test('browsers still get the SPA on /sub and /', async () => {

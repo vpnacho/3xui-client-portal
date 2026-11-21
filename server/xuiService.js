@@ -19,7 +19,18 @@ const https = require('node:https');
  */
 
 const DEFAULT_TIMEOUT_MS = 10_000;
-const MAX_TOKEN_LENGTH = 128;
+/**
+ * A subscription token must be an exact panel `subId`: letters, digits, dash
+ * and underscore, 6-64 chars. Emails (`@`), whitespace and anything else are
+ * rejected before the panel is contacted, so lookups by email or UUID are
+ * impossible by construction.
+ */
+const TOKEN_PATTERN = /^[A-Za-z0-9_-]{6,64}$/;
+
+/** Strict token check shared by the service and the HTTP layer. */
+function isValidSubscriptionToken(token) {
+  return typeof token === 'string' && TOKEN_PATTERN.test(token);
+}
 const ONLINE_TTL_MS = 10_000;
 const IP_CACHE_TTL_MS = 30_000;
 const MAX_IP_CACHE_ENTRIES = 500;
@@ -1146,8 +1157,11 @@ class XuiService {
    */
   async getClientByToken(token) {
     if (typeof token !== 'string') return null;
-    const subId = token.trim();
-    if (!subId || subId.length > MAX_TOKEN_LENGTH) return null;
+    // Strict exact-`subId` lookup: anything outside the token alphabet (an
+    // email, a UUID, whitespace) is rejected here, before the panel is ever
+    // contacted, and resolves to the same `null` as an unknown token.
+    if (!isValidSubscriptionToken(token)) return null;
+    const subId = token;
 
     const inbounds = await this.listInbounds();
     // Local fallback configs, only used when no subscription URL is configured.
@@ -1364,6 +1378,7 @@ class XuiService {
 module.exports = {
   XuiService,
   XuiError,
+  isValidSubscriptionToken,
   buildVlessUri,
   buildVmessUri,
   buildTrojanUri,

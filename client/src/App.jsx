@@ -17,6 +17,8 @@ export default function App() {
   const [token] = useState(() => parseToken());
   const [status, setStatus] = useState(() => (token ? 'loading' : 'home'));
   const [client, setClient] = useState(null);
+  /** Absolute ms timestamp until which retries are blocked (0 = not blocked). */
+  const [retryUntil, setRetryUntil] = useState(0);
   const controllerRef = useRef(null);
 
   const load = useCallback(
@@ -43,6 +45,21 @@ export default function App() {
           return;
         }
         if (response.status === 429) {
+          // Extract retryAfter from body or header.
+          let retryAfterSecs = 60;
+          try {
+            const body = await response.json();
+            if (typeof body.retryAfter === 'number' && body.retryAfter > 0) {
+              retryAfterSecs = body.retryAfter;
+            } else {
+              const header = response.headers.get('Retry-After');
+              if (header) retryAfterSecs = Math.max(1, Number(header) || retryAfterSecs);
+            }
+          } catch {
+            const header = response.headers.get('Retry-After');
+            if (header) retryAfterSecs = Math.max(1, Number(header) || retryAfterSecs);
+          }
+          setRetryUntil(Date.now() + retryAfterSecs * 1000);
           // A throttled background poll must not replace a rendered page.
           setStatus((current) => (current === 'ready' ? 'ready' : 'throttled'));
           return;
@@ -51,6 +68,7 @@ export default function App() {
           throw new Error(`HTTP ${response.status}`);
         }
 
+        setRetryUntil(0);
         setClient(await response.json());
         setStatus('ready');
       } catch (error) {
@@ -95,7 +113,9 @@ export default function App() {
 
           {status === 'loading' ? <LoadingState /> : null}
           {status === 'not-found' ? <ErrorState kind="not-found" /> : null}
-          {status === 'throttled' ? <ErrorState kind="throttled" onRetry={() => load()} /> : null}
+          {status === 'throttled' ? (
+            <ErrorState kind="throttled" retryUntil={retryUntil} onRetry={() => load()} />
+          ) : null}
           {status === 'error' ? <ErrorState onRetry={() => load()} /> : null}
           {status === 'ready' && client ? (
             <SubscriptionCard
